@@ -2,14 +2,66 @@ Description: >
     Christopher Gaines / Deploy a high-availability web app using CloudFormation
 
 Parameters:
+  EnvironmentName:
+      Description: An environment name that will be prefixed to resource names
+      Default: test
+      Type: String
+  MinNumEC2Instances:
+    Description: Minimum number of EC2 instances in AutoScalingGroup
+    Default: '1'
+    Type: String
+  MaxNumEC2Instances:
+    Description: Maximum number of EC2 instances in AutoScalingGroup
+    Default: '2'
+    Type: String
+  DesiredNumEC2Instances:
+    Description: Maximum number of EC2 instances in AutoScalingGroup
+    Default: '1'
+    Type: String
+  WebAppPort:
+    Description: Maximum number of EC2 instances in AutoScalingGroup
+    Default: 80
+    Type: Number
+
 Resources:
-  #instace profile contains the IAM Role name(s) that we want to associate to our auto scaling EC2 Servers
+  # IAM role for EC2 to access S3 bucket where application code lives
+  EC2ReadOnlyS3Role:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: 'IAM Role that allows EC2 servers to retreive code from appropriate S3 buckets'
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - ec2.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: EC2ReadOnlyS3Role
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: 's3:GetObject'
+                Resource: "arn:aws:s3:::udacity-demo-1/udacity.zip"
+  # Instance profile attached to our EC2 servers.
   ProfileWithRolesForOurApp:
     Type: AWS::IAM::InstanceProfile
     Properties: 
+      InstanceProfileName: S3ReadOnly
+      Path: /
       Roles:
-        - UdacityS3ReadOnlyEC2
-  
+        - !Ref EC2ReadOnlyS3Role
+  # Launch configuration for AutoScaling Group
+  WebAppLaunchConfig:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      IamInstanceProfile: !Ref ProfileWithRolesForOurApp
+      UserData:
+        Fn::Base64: !Sub |
           #!/bin/bash
           apt-get update -y
           apt-get install unzip awscli -y
@@ -18,25 +70,16 @@ Resources:
           cd /var/www/html
           aws s3 cp s3://udacity-demo-1/udacity.zip .
           unzip -o udacity.zip
-  #Launch configuration for autoscaling group
-  WebAppLaunchConfig:
-    Type: AWS::AutoScaling::LaunchConfiguration
-    Properties:
-      UserData:
-        Fn::Base64: !Sub |
-          #!/bin/bash
-
-      ImageId: ami-07ebfd5b3428b6f4d
-      KeyName: remove-soon
+      ImageId: ami-0ac80df6eff0e70b5
       SecurityGroups:
       - Ref: WebServerSecGroup
-      InstanceType: t2.medium
+      InstanceType: t3.medium
       BlockDeviceMappings:
       - DeviceName: "/dev/sdk"
         Ebs:
           VolumeSize: '10'
-  #autoscaling group 
-  WebAppGroup:
+  # AutoScaling Group 
+  WebAppAutoScalingGroup:
     Type: AWS::AutoScaling::AutoScalingGroup
     Properties:
       VPCZoneIdentifier:
@@ -44,12 +87,12 @@ Resources:
           !Sub "${EnvironmentName}-PRIV-NETS"
       LaunchConfigurationName:
         Ref: WebAppLaunchConfig
-      MinSize: '4'
-      DesiredCapacity: '4'
-      MaxSize: '4'
+      MinSize: !Ref MinNumEC2Instances
+      DesiredCapacity: !Ref DesiredNumEC2Instances
+      MaxSize: !Ref MaxNumEC2Instances
       TargetGroupARNs:
             - Ref: WebAppTargetGroup
-
+  # Target Group
   WebAppTargetGroup:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
     Properties:
@@ -58,12 +101,13 @@ Resources:
       HealthCheckProtocol: HTTP
       HealthCheckTimeoutSeconds: 30
       HealthyThresholdCount: 2
-      Port: 80
+      Port: !Ref WebAppPort
       Protocol: HTTP
       UnhealthyThresholdCount: 5
       VpcId: 
         Fn::ImportValue:
           Fn::Sub: "${EnvironmentName}-VPCID"
+  # Security group for app server
   WebServerSecGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
@@ -73,18 +117,15 @@ Resources:
           !Sub "${EnvironmentName}-VPCID"
       SecurityGroupIngress:
       - IpProtocol: tcp
-        FromPort: 80
-        ToPort: 80
-        CidrIp: 0.0.0.0/0
-      - IpProtocol: tcp
-        FromPort: 22
-        ToPort: 22
+        FromPort: !Ref WebAppPort
+        ToPort: !Ref WebAppPort
         CidrIp: 0.0.0.0/0
       SecurityGroupEgress:
       - IpProtocol: tcp
         FromPort: 0
         ToPort: 65535
         CidrIp: 0.0.0.0/0
+  # Security group for load balancer
   LBSecGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
@@ -94,13 +135,49 @@ Resources:
           !Sub "${EnvironmentName}-VPCID"
       SecurityGroupIngress:
       - IpProtocol: tcp
-        FromPort: 80
-        ToPort: 80
+        FromPort: !Ref WebAppPort
+        ToPort: !Ref WebAppPort
         CidrIp: 0.0.0.0/0
       SecurityGroupEgress:
       - IpProtocol: tcp
-        FromPort: 80
-        ToPort: 80
+        FromPort: !Ref WebAppPort
+        ToPort: !Ref WebAppPort
         CidrIp: 0.0.0.0/0
-  Outputs: 
-  #Bonus points for useful outputs!
+  # Load Balancer
+  WebAppLB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Subnets:
+      - Fn::ImportValue: !Sub "${EnvironmentName}-PUB1-SN"
+      - Fn::ImportValue: !Sub "${EnvironmentName}-PUB2-SN"
+      SecurityGroups:
+      - Ref: LBSecGroup
+  # Load Balancer's Listener
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+      - Type: forward
+        TargetGroupArn:
+          Ref: WebAppTargetGroup
+      LoadBalancerArn:
+        Ref: WebAppLB
+      Port: !Ref WebAppPort
+      Protocol: HTTP
+  # Rules for Listener
+  ALBListenerRule:
+      Type: AWS::ElasticLoadBalancingV2::ListenerRule
+      Properties:
+        Actions:
+        - Type: forward
+          TargetGroupArn: !Ref 'WebAppTargetGroup'
+        Conditions:
+        - Field: path-pattern
+          Values: [/]
+        ListenerArn: !Ref 'Listener'
+        Priority: 1
+
+Outputs:
+  LoadBalancerUrl:
+    Description: The URL of the ALB
+    Value: !Sub "http://${WebAppLB.DNSName}"
